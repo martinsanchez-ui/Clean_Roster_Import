@@ -1088,7 +1088,44 @@ def main():
             )
 
             # Limit the number of rows in combined_df based on total_send_amount
-            combined_df = combined_df_total.head(total_send_amount)
+            selected_df = combined_df_total.dropna(
+                subset=["office_id", "workflow_id"]
+            ).head(total_send_amount)
+            selected_ids = set(zip(selected_df["office_id"], selected_df["workflow_id"]))
+            combined_df_total["selected"] = list(
+                zip(combined_df_total["office_id"], combined_df_total["workflow_id"])
+            )
+            combined_df_total["selected"] = combined_df_total["selected"].isin(selected_ids)
+            combined_df_total["excluded_reason"] = ""
+            combined_df_total.loc[~combined_df_total["selected"], "excluded_reason"] = "not_in_top_N"
+            combined_df_total.loc[
+                combined_df_total["controlling_date"].isna(), "excluded_reason"
+            ] = "missing_controlling_date"
+            combined_df_total["is_jacksonville"] = combined_df_total["office_id"] == 283908
+            if FULL_DRY_RUN:
+                evidence_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                evidence_filename = "clean_roster_prioritization_evidence_{ts}.csv".format(
+                    ts=evidence_timestamp
+                )
+                evidence_path = os.path.join(SCRIPT_PATH, evidence_filename)
+                evidence_columns = [
+                    "office_id",
+                    "workflow_id",
+                    "tier",
+                    "controlling_date",
+                    "webinar_date",
+                    "host_office_id",
+                    "host_webinar_date",
+                    "relationship_type",
+                    "activity_created_at",
+                    "opportunity_last_updated",
+                    "selected",
+                    "excluded_reason",
+                    "is_jacksonville"
+                ]
+                combined_df_total[evidence_columns].to_csv(evidence_path, index=False)
+                log.info("DRY_RUN: wrote evidence CSV")
+            combined_df = selected_df
             log.info("Selected roster count: {count}".format(count=len(combined_df.index)))
             log.info("Top 20 roster prioritization decisions:")
             for _, row in combined_df.head(20).iterrows():
