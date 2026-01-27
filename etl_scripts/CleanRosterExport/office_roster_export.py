@@ -38,6 +38,7 @@ RETRY_ATTEMPTS = 3
 RETRY_PAUSE = 5
 SEND_TEAMS_MESSAGE_SUMMARY = "Clean_Roster_Export"
 SEND_TEAMS_MESSAGE_ACTIVITY_TITLE = "Error occurred - Clean_Roster_Export"
+FULL_DRY_RUN = True  # TEMP - flip to False for production
 
 SECRETS = load_secrets(ENV_FILE_PATH, ["bi_hostname", "bi_username", "bi_password", "bi_database", 
                                        "client_id", "client_secret", "tenant_id", "primary_smtp_address", "outlook_server", 
@@ -67,6 +68,13 @@ db = mysql.connect(SECRETS.get("bi_hostname"), SECRETS.get("bi_username"), SECRE
 log.info("Database connection open.")
 
 
+def send_teams_message_safe(*args, **kwargs):
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: would send Teams message")
+        return
+    return send_teams_message(*args, **kwargs)
+
+
 def send_email(account, subject, body, recipients, attachments=None):
     """
     Send an email.
@@ -85,6 +93,9 @@ def send_email(account, subject, body, recipients, attachments=None):
     --------
     >>> send_email(account, 'Subject line', 'Hello!', ['info@example.com'])
     """
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: would send email")
+        return
     to_recipients = [Mailbox(email_address=recipients)]
     print(to_recipients)
 
@@ -357,6 +368,9 @@ def get_current_webinar_info(office_ids):
 
 def set_roster_status(workflow_id):
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: would set status")
+        return
 
     log.info("Setting roster status to 1441 (Third Party Cleaning)...")
 
@@ -374,12 +388,15 @@ def set_roster_status(workflow_id):
     log.info(r.text)
     if r.status_code != 200:
         message = "Status code is: {sc}, for update roster status. Please investigate".format(sc=r.status_code)
-        send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                           activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=message)
+        send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=message)
 
 
 def update_stats_table(params):
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: would insert stats")
+        return
 
     insert_sql = """INSERT IGNORE INTO bi_warehouse_prd.office_roster_automation_f
 (office_id, workflow_id, sent_records, sent_to_email, sent_filename, sent_dtt, received_records, received_records_not_found, received_records_update, received_records_insert, received_from_email, received_filename, received_dtt, added_ts, last_updated_ts)
@@ -757,7 +774,11 @@ def export_office_roster(office_id, workflow_id, email_address):
 
     log.info("Preparing email, getting attachments...")
     # Add attachments
-    file_list = ["Clean Office Roster.pdf", filename]
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: skipping PDF attachment")
+        file_list = [filename]
+    else:
+        file_list = ["Clean Office Roster.pdf", filename]
 
     attachments = []
 
@@ -795,8 +816,8 @@ def export_office_roster(office_id, workflow_id, email_address):
                 except (ValueError, TypeError):
                     # Handle the case where conversion fails
                     err = "Error: workflow_id is not convertible to int"
-                    send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                                       activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+                    send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
                     
                     # Handle error accordingly (e.g., set to None or handle exception)
                     workflow_id = None  # or raise an exception, or whatever your error handling strategy is
@@ -949,8 +970,19 @@ def main():
     try:
         # export_office_roster(35678, 7616997, "nobody@example.com")
         ## read in Google Sheet
-        google_df = load_google_sheets_data()
-        if (len(google_df) - 1) > 0:
+        if FULL_DRY_RUN:
+            log.info("DRY_RUN: using synthetic Google Sheet data")
+            google_df = pd.DataFrame(
+                [{
+                    "Email Address": "dryrun@example.com",
+                    "Send Amount": 3
+                }]
+            )
+            has_google_rows = len(google_df.index) > 0
+        else:
+            google_df = load_google_sheets_data()
+            has_google_rows = len(google_df.index) > 0
+        if has_google_rows:
             # Fetch data and create the combined dataframe outside the recipient loop
             office_webinar_list_df = grab_office_list_just_webinar()
             office_webinar_list_df['office_id'] = office_webinar_list_df['office_id'].astype(int)
@@ -1092,8 +1124,8 @@ def main():
                                 except ValueError:
                                     err = f"Cannot convert workflow_id {office['workflow_id']} to int."
                                     log.error(err)
-                                    send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                                                       activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+                                    send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
                                     
                                     raise  # Re-throw the caught exception to terminate the script
 
@@ -1104,8 +1136,8 @@ def main():
                                 except ValueError:
                                     err = f"Cannot convert office_id {office['office_id']} to int."
                                     log.error(err)
-                                    send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                                                       activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+                                    send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
                                     
                                     raise  # Re-throw the caught exception to terminate the script
 
@@ -1119,7 +1151,10 @@ def main():
                         log.error(f"Send amount is zero for {email_address}!")
                 else:
                     log.error(f"Blank email found at index position {idx}")
-            backup_files()
+            if FULL_DRY_RUN:
+                log.info("DRY_RUN: would back up files")
+            else:
+                backup_files()
         else:
             err = "No rows in Google Sheet!"
             log.critical(err)
@@ -1129,8 +1164,8 @@ def main():
         log.critical("Critical error has occurred, sounding alarm!  Error info: {e}".format(e=e))
         err = (traceback.print_exc())
         print(err)
-        send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                           activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+        send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
         
     finally:
         log.info("Closing database connection...")
