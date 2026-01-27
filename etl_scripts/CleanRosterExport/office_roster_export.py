@@ -68,6 +68,13 @@ db = mysql.connect(SECRETS.get("bi_hostname"), SECRETS.get("bi_username"), SECRE
 log.info("Database connection open.")
 
 
+def send_teams_message_safe(*args, **kwargs):
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: would send Teams message")
+        return
+    return send_teams_message(*args, **kwargs)
+
+
 def send_email(account, subject, body, recipients, attachments=None):
     """
     Send an email.
@@ -381,8 +388,8 @@ def set_roster_status(workflow_id):
     log.info(r.text)
     if r.status_code != 200:
         message = "Status code is: {sc}, for update roster status. Please investigate".format(sc=r.status_code)
-        send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                           activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=message)
+        send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=message)
 
 
 def update_stats_table(params):
@@ -767,7 +774,11 @@ def export_office_roster(office_id, workflow_id, email_address):
 
     log.info("Preparing email, getting attachments...")
     # Add attachments
-    file_list = ["Clean Office Roster.pdf", filename]
+    if FULL_DRY_RUN:
+        log.info("DRY_RUN: skipping PDF attachment")
+        file_list = [filename]
+    else:
+        file_list = ["Clean Office Roster.pdf", filename]
 
     attachments = []
 
@@ -805,8 +816,8 @@ def export_office_roster(office_id, workflow_id, email_address):
                 except (ValueError, TypeError):
                     # Handle the case where conversion fails
                     err = "Error: workflow_id is not convertible to int"
-                    send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                                       activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+                    send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
                     
                     # Handle error accordingly (e.g., set to None or handle exception)
                     workflow_id = None  # or raise an exception, or whatever your error handling strategy is
@@ -970,7 +981,7 @@ def main():
             has_google_rows = len(google_df.index) > 0
         else:
             google_df = load_google_sheets_data()
-            has_google_rows = (len(google_df) - 1) > 0
+            has_google_rows = len(google_df.index) > 0
         if has_google_rows:
             # Fetch data and create the combined dataframe outside the recipient loop
             office_webinar_list_df = grab_office_list_just_webinar()
@@ -1113,8 +1124,8 @@ def main():
                                 except ValueError:
                                     err = f"Cannot convert workflow_id {office['workflow_id']} to int."
                                     log.error(err)
-                                    send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                                                       activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+                                    send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
                                     
                                     raise  # Re-throw the caught exception to terminate the script
 
@@ -1125,8 +1136,8 @@ def main():
                                 except ValueError:
                                     err = f"Cannot convert office_id {office['office_id']} to int."
                                     log.error(err)
-                                    send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                                                       activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+                                    send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
                                     
                                     raise  # Re-throw the caught exception to terminate the script
 
@@ -1153,8 +1164,8 @@ def main():
         log.critical("Critical error has occurred, sounding alarm!  Error info: {e}".format(e=e))
         err = (traceback.print_exc())
         print(err)
-        send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
-                           activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
+        send_teams_message_safe(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
+                                activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
         
     finally:
         log.info("Closing database connection...")
