@@ -504,9 +504,9 @@ def _find_duplicate_candidates(company_id, first_name, last_name, email, cell_ph
     duplicate_candidates = lookup_cursor.fetchall() or []
 
     if len(duplicate_candidates) < 2:
-        log.info("Manual merge required (Step 1/8): matching did not produce duplicate set. Candidates=%s", duplicate_candidates)
+        log.info(f"Manual merge required (Step 1/8): matching did not produce duplicate set. Candidates={duplicate_candidates}")
     else:
-        log.info("Step 1 match success. Candidate IDs=%s", [row[0] for row in duplicate_candidates])
+        log.info(f"Step 1 match success. Candidate IDs={[row[0] for row in duplicate_candidates]}")
 
     return duplicate_candidates
 
@@ -587,7 +587,7 @@ def _pick_winner_contact(candidate_ids):
         metrics_cur = execute_query(dbmaster, metrics_sql, [*candidate_ids, *candidate_ids, *candidate_ids], db_name="CRM")
         metrics_rows = metrics_cur.fetchall() or []
     except Exception as e:
-        log.info("Manual merge required: failed to retrieve winner metrics. Error=%s", e)
+        log.info(f"Manual merge required: failed to retrieve winner metrics. Error={e}")
         return 0
 
     metrics_by_id = {
@@ -605,21 +605,20 @@ def _pick_winner_contact(candidate_ids):
 
     if len(metrics_by_id) != len(set(candidate_ids)):
         missing_ids = sorted(set(candidate_ids) - set(metrics_by_id.keys()))
-        log.info("Manual merge required (Step 8): insufficient metrics for matched contacts. Missing=%s", missing_ids)
+        log.info(f"Manual merge required (Step 8): insufficient metrics for matched contacts. Missing={missing_ids}")
         return 0
 
     metrics = [metrics_by_id[cid] for cid in candidate_ids]
-    log.info("Winner selection metrics: %s", metrics)
+    log.info(f"Winner selection metrics: {metrics}")
 
     # Step 2 / Step 7
     in_program_contacts = [m for m in metrics if m["in_program"] == 1]
     if in_program_contacts:
         if len(in_program_contacts) == 1:
             winner = in_program_contacts[0]["contact_id"]
-            log.info("Winner selected (Step 7): only one matched contact in program. Winner=%s", winner)
+            log.info(f"Winner selected (Step 7): only one matched contact in program. Winner={winner}")
             return winner
-        log.info("Manual merge required (Step 7): multiple matched contacts are in program. Contacts=%s",
-                 [m["contact_id"] for m in in_program_contacts])
+        log.info(f"Manual merge required (Step 7): multiple matched contacts are in program. Contacts={[m['contact_id'] for m in in_program_contacts]}")
         return 0
 
     # Step 3: all NOT in program -> most recent Program History
@@ -630,7 +629,7 @@ def _pick_winner_contact(candidate_ids):
             key=lambda m: (m["last_program_date"], m["created_ts"], m["contact_id"]),
             reverse=True,
         )[0]
-        log.info("Winner selected (Step 3): most recent program history. Winner=%s", winner_metric["contact_id"])
+        log.info(f"Winner selected (Step 3): most recent program history. Winner={winner_metric['contact_id']}")
         return winner_metric["contact_id"]
 
     # Step 4: open opp preferred, else most recent opp
@@ -641,7 +640,7 @@ def _pick_winner_contact(candidate_ids):
             key=lambda m: (m["has_open_opp"], m["last_opp_ts"] or datetime.datetime.min, m["created_ts"], m["contact_id"]),
             reverse=True,
         )[0]
-        log.info("Winner selected (Step 4): opportunity rule. Winner=%s", winner_metric["contact_id"])
+        log.info(f"Winner selected (Step 4): opportunity rule. Winner={winner_metric['contact_id']}")
         return winner_metric["contact_id"]
 
     # Step 5/6: demo office company type rule, winner is most recently created in both branches.
@@ -653,9 +652,9 @@ def _pick_winner_contact(candidate_ids):
     )[0]
 
     if non_demo_contacts:
-        log.info("Winner selected (Step 5): at least one contact is not Demo Office. Winner=%s", winner_metric["contact_id"])
+        log.info(f"Winner selected (Step 5): at least one contact is not Demo Office. Winner={winner_metric['contact_id']}")
     else:
-        log.info("Winner selected (Step 6): all contacts are Demo Office. Winner=%s", winner_metric["contact_id"])
+        log.info(f"Winner selected (Step 6): all contacts are Demo Office. Winner={winner_metric['contact_id']}")
 
     return winner_metric["contact_id"]
 
@@ -692,10 +691,10 @@ def merge_duplicate_contacts_for_row(company_id, first_name, last_name, email, c
         }
         headers = {"HTTP_API_KEY": merge_api_key}
 
-        log.info("Merging duplicates into winner %s. Duplicate IDs: %s", winner_contact_id, contacts_to_merge)
+        log.info(f"Merging duplicates into winner {winner_contact_id}. Duplicate IDs: {contacts_to_merge}")
         merge_response = requests.post(merge_api_url, json=merge_payload, headers=headers, verify=False)
-        log.info("Merge API status code: %s", merge_response.status_code)
-        log.info("Merge API response: %s", merge_response.text)
+        log.info(f"Merge API status code: {merge_response.status_code}")
+        log.info(f"Merge API response: {merge_response.text}")
 
     except Exception as e:
         log.error(f"An error occurred during duplicate merge automation: {e}")
@@ -1638,9 +1637,9 @@ def main():
         get_cleaned_roster_from_email()
     except mysql.Error as err:
         log.error(f"An error occurred with MySQL: {err}")
-        log.error("Error code:", err.args[0])
-        log.error("Error message:", err.args[1])
-        log.error("Full error:", str(err))
+        log.error(f"Error code: {err.args[0]}")
+        log.error(f"Error message: {err.args[1]}")
+        log.error(f"Full error: {str(err)}")
         log.error(traceback.format_exc())
         send_teams_message(summary=SEND_TEAMS_MESSAGE_SUMMARY, activityTitle=SEND_TEAMS_MESSAGE_ACTIVITY_TITLE, 
                            activitySubtitle=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text=err)
