@@ -448,6 +448,260 @@ def delete_contact(contact_id):
         log.error(traceback.format_exc())
 
 
+def _find_duplicate_candidates(company_id, first_name, last_name, email, cell_phone, direct_phone):
+    log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+
+    # Step 1: partial first name + full last name + (email OR phone)
+    first_name_prefix_len = int(os.getenv("CRM_DUPLICATE_FIRST_NAME_PREFIX_LEN", "3"))
+
+    normalized_first_name = (first_name or "").strip().lower()
+    normalized_last_name = (last_name or "").strip().lower()
+    normalized_email = (email or "").strip().lower()
+    normalized_cell_phone = clean_phone_number(cell_phone or "")
+    normalized_direct_phone = clean_phone_number(direct_phone or "")
+    normalized_phones = [phone for phone in {normalized_cell_phone, normalized_direct_phone} if phone]
+
+    first_name_prefix = normalized_first_name[:first_name_prefix_len]
+
+    if not first_name_prefix or not normalized_last_name:
+        log.info("Manual merge required (Step 1): missing first name/last name for matching.")
+        return []
+
+    if not normalized_email and not normalized_phones:
+        log.info("Manual merge required (Step 1): missing both email and phone for matching.")
+        return []
+
+    match_clauses = []
+    params = [company_id, normalized_last_name, f"{first_name_prefix}%"]
+
+    if normalized_email:
+        match_clauses.append("(cci.discriminator = 'Email' AND LOWER(TRIM(cci.contactinfo)) = %s)")
+        params.append(normalized_email)
+
+    for normalized_phone in normalized_phones:
+        match_clauses.append("""(
+            cci.discriminator = 'Phone'
+            AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(cci.contactinfo), '-', ''), '(', ''), ')', ''), ' ', ''), '.', ''), '+', '') = %s
+        )""")
+        params.append(normalized_phone)
+
+    lookup_sql = f"""
+        SELECT DISTINCT
+            c.contact_id
+        FROM
+            xrms.contacts c
+            JOIN xrms.contacts_contactinfo cci ON cci.userid = c.contact_id
+        WHERE
+            c.contact_record_status = 'a'
+            AND cci.row_status = 'a'
+            AND c.company_id = %s
+            AND LOWER(TRIM(c.last_name)) = %s
+            AND LOWER(TRIM(c.first_names)) LIKE %s
+            AND ({' OR '.join(match_clauses)})
+    """
+
+    lookup_cursor = execute_query(dbmaster, lookup_sql, params, db_name="CRM")
+    duplicate_candidates = lookup_cursor.fetchall() or []
+
+    if len(duplicate_candidates) < 2:
+        log.info("Manual merge required (Step 1/8): matching did not produce duplicate set. Candidates=%s", duplicate_candidates)
+    else:
+        log.info("Step 1 match success. Candidate IDs=%s", [row[0] for row in duplicate_candidates])
+
+    return duplicate_candidates
+
+
+def _pick_winner_contact(candidate_ids):
+    log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+
+    if len(candidate_ids) < 2:
+        log.info("Manual merge required (Step 8): fewer than two matched contacts.")
+        return 0
+
+    placeholders = ", ".join(["%s"] * len(candidate_ids))
+
+    metrics_sql = f"""
+        SELECT
+            c.contact_id,
+            c.entered_at AS created_ts,
+            CASE
+                WHEN c.cycle_id IS NOT NULL
+                    AND c.cycle_id != 0
+                    AND cy.cycle_id IS NOT NULL
+                    AND (cy.end_date = '0000-00-00' OR cy.end_date >= CURDATE())
+                THEN 1 ELSE 0
+            END AS in_program,
+            pd.last_program_date,
+            COALESCE(opp.has_open_opp, 0) AS has_open_opp,
+            opp.last_opp_ts,
+            COALESCE(demo.is_demo_company_type, 0) AS is_demo_company_type
+        FROM
+            xrms.contacts c
+            LEFT JOIN xrms.cycle cy ON cy.cycle_id = c.cycle_id
+            LEFT JOIN (
+                SELECT
+                    contact_id,
+                    MAX(date) AS last_program_date
+                FROM
+                    xrms.program_dates
+                WHERE
+                    row_status = 'a'
+                    AND contact_id IN ({placeholders})
+                GROUP BY
+                    contact_id
+            ) pd ON pd.contact_id = c.contact_id
+            LEFT JOIN (
+                SELECT
+                    o.contact_id,
+                    MAX(CASE WHEN os.status_open_indicator = 'o' THEN 1 ELSE 0 END) AS has_open_opp,
+                    MAX(COALESCE(o.closed_at, o.last_modified_at, o.entered_at)) AS last_opp_ts
+                FROM
+                    xrms.opportunities o
+                    LEFT JOIN xrms.opportunity_statuses os
+                        ON os.opportunity_status_id = o.opportunity_status_id
+                        AND os.opportunity_status_record_status = 'a'
+                WHERE
+                    o.opportunity_record_status = 'a'
+                    AND o.contact_id IN ({placeholders})
+                GROUP BY
+                    o.contact_id
+            ) opp ON opp.contact_id = c.contact_id
+            LEFT JOIN (
+                SELECT
+                    cct.company_id,
+                    MAX(CASE WHEN LOWER(ct.title) LIKE '%demo%' THEN 1 ELSE 0 END) AS is_demo_company_type
+                FROM
+                    xrms.companies_and_company_types cct
+                    JOIN xrms.company_types ct ON ct.company_type_id = cct.company_type_id
+                WHERE
+                    ct.row_status = 'a'
+                GROUP BY
+                    cct.company_id
+            ) demo ON demo.company_id = c.company_id
+        WHERE
+            c.contact_record_status = 'a'
+            AND c.contact_id IN ({placeholders})
+    """
+
+    try:
+        metrics_cur = execute_query(dbmaster, metrics_sql, [*candidate_ids, *candidate_ids, *candidate_ids], db_name="CRM")
+        metrics_rows = metrics_cur.fetchall() or []
+    except Exception as e:
+        log.info("Manual merge required: failed to retrieve winner metrics. Error=%s", e)
+        return 0
+
+    metrics_by_id = {
+        int(row[0]): {
+            "contact_id": int(row[0]),
+            "created_ts": row[1],
+            "in_program": int(row[2]) if row[2] is not None else 0,
+            "last_program_date": row[3],
+            "has_open_opp": int(row[4]) if row[4] is not None else 0,
+            "last_opp_ts": row[5],
+            "is_demo_company_type": int(row[6]) if row[6] is not None else 0,
+        }
+        for row in metrics_rows
+    }
+
+    if len(metrics_by_id) != len(set(candidate_ids)):
+        missing_ids = sorted(set(candidate_ids) - set(metrics_by_id.keys()))
+        log.info("Manual merge required (Step 8): insufficient metrics for matched contacts. Missing=%s", missing_ids)
+        return 0
+
+    metrics = [metrics_by_id[cid] for cid in candidate_ids]
+    log.info("Winner selection metrics: %s", metrics)
+
+    # Step 2 / Step 7
+    in_program_contacts = [m for m in metrics if m["in_program"] == 1]
+    if in_program_contacts:
+        if len(in_program_contacts) == 1:
+            winner = in_program_contacts[0]["contact_id"]
+            log.info("Winner selected (Step 7): only one matched contact in program. Winner=%s", winner)
+            return winner
+        log.info("Manual merge required (Step 7): multiple matched contacts are in program. Contacts=%s",
+                 [m["contact_id"] for m in in_program_contacts])
+        return 0
+
+    # Step 3: all NOT in program -> most recent Program History
+    with_program_history = [m for m in metrics if m["last_program_date"] is not None]
+    if with_program_history:
+        winner_metric = sorted(
+            with_program_history,
+            key=lambda m: (m["last_program_date"], m["created_ts"], m["contact_id"]),
+            reverse=True,
+        )[0]
+        log.info("Winner selected (Step 3): most recent program history. Winner=%s", winner_metric["contact_id"])
+        return winner_metric["contact_id"]
+
+    # Step 4: open opp preferred, else most recent opp
+    with_opp_signal = [m for m in metrics if m["has_open_opp"] == 1 or m["last_opp_ts"] is not None]
+    if with_opp_signal:
+        winner_metric = sorted(
+            with_opp_signal,
+            key=lambda m: (m["has_open_opp"], m["last_opp_ts"] or datetime.datetime.min, m["created_ts"], m["contact_id"]),
+            reverse=True,
+        )[0]
+        log.info("Winner selected (Step 4): opportunity rule. Winner=%s", winner_metric["contact_id"])
+        return winner_metric["contact_id"]
+
+    # Step 5/6: demo office company type rule, winner is most recently created in both branches.
+    non_demo_contacts = [m for m in metrics if m["is_demo_company_type"] == 0]
+    winner_metric = sorted(
+        metrics,
+        key=lambda m: (m["created_ts"], m["contact_id"]),
+        reverse=True,
+    )[0]
+
+    if non_demo_contacts:
+        log.info("Winner selected (Step 5): at least one contact is not Demo Office. Winner=%s", winner_metric["contact_id"])
+    else:
+        log.info("Winner selected (Step 6): all contacts are Demo Office. Winner=%s", winner_metric["contact_id"])
+
+    return winner_metric["contact_id"]
+
+def merge_duplicate_contacts_for_row(company_id, first_name, last_name, email, cell_phone, direct_phone):
+    log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
+
+    merge_api_url = os.getenv("merge_contact_api_url") or os.getenv("MERGE_CONTACT_API_URL")
+    merge_api_key = os.getenv("merge_contact_api_key") or os.getenv("MERGE_CONTACT_API_KEY")
+
+    if not merge_api_url or not merge_api_key:
+        log.warning("Merge API credentials are missing. Skipping duplicate merge step.")
+        return
+
+    try:
+        duplicate_candidates = _find_duplicate_candidates(company_id, first_name, last_name, email, cell_phone, direct_phone)
+        candidate_ids = sorted({int(candidate[0]) for candidate in duplicate_candidates if candidate and candidate[0]})
+
+        if len(candidate_ids) < 2:
+            return
+
+        winner_contact_id = _pick_winner_contact(candidate_ids)
+        if winner_contact_id <= 0:
+            log.info("Winner contact could not be determined automatically. Manual merge required.")
+            return
+
+        contacts_to_merge = [cid for cid in candidate_ids if cid != winner_contact_id]
+        if not contacts_to_merge:
+            return
+
+        merge_payload = {
+            "api_key": merge_api_key,
+            "primary_contact_id": winner_contact_id,
+            "contacts_to_merge": contacts_to_merge
+        }
+        headers = {"HTTP_API_KEY": merge_api_key}
+
+        log.info("Merging duplicates into winner %s. Duplicate IDs: %s", winner_contact_id, contacts_to_merge)
+        merge_response = requests.post(merge_api_url, json=merge_payload, headers=headers, verify=False)
+        log.info("Merge API status code: %s", merge_response.status_code)
+        log.info("Merge API response: %s", merge_response.text)
+
+    except Exception as e:
+        log.error(f"An error occurred during duplicate merge automation: {e}")
+        log.error(traceback.format_exc())
+
+
 def contactinfo_insert(contact_id, contact_info, ctype, source_column=None):
     log.debug("Entering {}()".format(sys._getframe().f_code.co_name))
 
@@ -697,6 +951,8 @@ def process_insert(insert_df, company_id):
         linkedin_url = str(row["linkedin_url"]).replace(" ", "") if row["linkedin_url"] != 0 else None
         facebook_url = str(row["facebook_url"]).replace(" ", "") if row["facebook_url"] != 0 else None
         twitter_url = str(row["twitter_url"]).replace(" ", "") if row["twitter_url"] != 0 else None
+
+        merge_duplicate_contacts_for_row(company_id, first_name, last_name, email, cell_phone, direct_phone)
 
         insert_params = (
             company_id, last_name, first_name, gender, title, email, cell_phone, facebook_url, twitter_url,
